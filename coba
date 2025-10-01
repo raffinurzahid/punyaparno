@@ -1,3 +1,621 @@
 https://www.youtube.com/watch?v=JWhkaHPUGnA
 
 https://www.youtube.com/shorts/x65h9wK38Q4
+
+
+const express = require('express');
+const path = require('path');
+const cors = require('cors');
+const morgan = require('morgan');
+const bodyParser = require('body-parser');
+require('dotenv').config();
+
+// Import database configuration
+const { testConnection } = require('./config/db');
+
+// Import routes
+const dashboardRoutes = require('./routes/dashboardRoutes');
+const transaksiRoutes = require('./routes/transaksiRoutes');
+const authRoutes = require('./routes/authRoutes');
+const notificationsRoutes = require('./routes/notificationsRoutes');
+const masterBarangRoutes = require('./routes/masterBarangRoutes');
+const masterGudangRoutes = require('./routes/masterGudangRoutes');
+
+// Import middleware
+const errorMiddleware = require('./middleware/errorMiddleware');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Middleware configuration
+app.use(cors());
+app.use(morgan('combined'));
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+
+// Static files configuration
+app.use(express.static(path.join(__dirname, '../frontend/public')));
+
+// View engine configuration
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, '../frontend/views'));
+
+// Test database connection on startup
+testConnection();
+
+// Setup notification creator untuk transaksi routes
+if (notificationsRoutes.createTransactionNotification && transaksiRoutes.setNotificationCreator) {
+  transaksiRoutes.setNotificationCreator(notificationsRoutes.createTransactionNotification);
+}
+
+// Routes configuration
+app.use('/', dashboardRoutes);
+app.use('/api/transaksi', transaksiRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/notifications', notificationsRoutes); 
+app.use('/api/master-barang', masterBarangRoutes);
+app.use('/api/master-gudang', masterGudangRoutes);
+
+// Web Routes untuk EJS views
+app.get('/transactions', (req, res) => {
+  res.render('transaksi', {
+    title: 'Transactions - WMS Help Desk',
+    user: {
+      name: 'Admin User',
+      role: 'Help Desk Team'
+    }
+  });
+});
+
+// Web routes untuk halaman master data
+app.get('/master-barang', (req, res) => {
+  res.render('pages/master-barang', {
+    title: 'Master Data Barang - WMS Help Desk',
+    currentPage: 'master-barang'
+  });
+});
+
+app.get('/master-gudang', (req, res) => {
+  res.render('pages/master-gudang', {
+    title: 'Master Gudang Barang - WMS Help Desk',
+    currentPage: 'master-gudang'
+  });
+});
+
+app.get('/api/items', async (req, res) => {
+  try {
+    const { type } = req.query;
+    const { query } = require('./config/db');
+    
+    let sql = `
+      SELECT 
+        b.id_barang,
+        b.nama_barang,
+        b.jenis_barang as spesifikasi,
+        COALESCE(
+          (SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'),
+          0
+        ) - COALESCE(
+          (SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')),
+          0
+        ) as qty_stok,
+        (SELECT g.nama_gudang FROM transaksi t 
+         JOIN gudang g ON t.id_gudang = g.id_gudang 
+         WHERE t.id_barang = b.id_barang 
+         ORDER BY t.tanggal DESC LIMIT 1) as location
+      FROM barang b
+    `;
+    
+    if (type === 'low') {
+      sql += ` HAVING (
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'), 0) -
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')), 0)
+      ) < 5 AND (
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'), 0) -
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')), 0)
+      ) >= 0`;
+    }
+    
+    sql += ` ORDER BY b.nama_barang`;
+    
+    const result = await query(sql);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json([]);
+  }
+});
+
+// Enhanced API routes dengan error handling yang lebih baik
+app.get('/api/dashboard', async (req, res) => {
+  try {
+    // Fetch real transaction data untuk dashboard
+    const { query } = require('./config/db');
+    
+    const transactionsResult = await query('SELECT * FROM transaksi ORDER BY tanggal DESC');
+    const transactions = transactionsResult.rows;
+    
+    // Group data berdasarkan kategori equipment
+    const equipmentData = {
+      desktop: transactions.filter(t => t.jenis_barang && t.jenis_barang.toLowerCase().includes('desktop')),
+      notebook: transactions.filter(t => t.jenis_barang && (t.jenis_barang.toLowerCase().includes('notebook') || t.jenis_barang.toLowerCase().includes('laptop'))),
+      mouse: transactions.filter(t => t.jenis_barang && t.jenis_barang.toLowerCase().includes('mouse')),
+      monitor: transactions.filter(t => t.jenis_barang && t.jenis_barang.toLowerCase().includes('monitor')),
+      keyboard: transactions.filter(t => t.jenis_barang && t.jenis_barang.toLowerCase().includes('keyboard')),
+      ram: transactions.filter(t => t.jenis_barang && t.jenis_barang.toLowerCase().includes('ram'))
+    };
+    
+    res.json({
+      success: true,
+      data: {
+        equipment: equipmentData,
+        totalItems: transactions.length,
+        lowStockItems: transactions.filter(t => t.qty_stok && parseInt(t.qty_stok) < 5).length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching dashboard data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch dashboard data',
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/transaction-stats', async (req, res) => {
+  try {
+    const { query } = require('./config/db');
+    
+    // Transaction distribution
+    const distributionResult = await query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE status_barang = 'Masuk') as rcv,
+        COUNT(*) FILTER (WHERE status_barang = 'Assignment') as ass,
+        COUNT(*) FILTER (WHERE status_barang = 'Disposal') as disp
+      FROM transaksi
+    `);
+    
+    // Monthly activity (last 6 months)
+    const monthlyResult = await query(`
+      SELECT 
+        TO_CHAR(tanggal, 'Mon') as month,
+        COUNT(*) as value
+      FROM transaksi 
+      WHERE tanggal >= NOW() - INTERVAL '6 months'
+      GROUP BY TO_CHAR(tanggal, 'Mon'), EXTRACT(MONTH FROM tanggal)
+      ORDER BY EXTRACT(MONTH FROM tanggal)
+    `);
+    
+    res.json({
+      success: true,
+      data: {
+        distribution: distributionResult.rows[0] || { rcv: 0, ass: 0, disp: 0 },
+        monthly: monthlyResult.rows || []
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching transaction stats:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch transaction stats',
+      data: {
+        distribution: { rcv: 0, ass: 0, disp: 0 },
+        monthly: []
+      }
+    });
+  }
+});
+
+app.get('/api/barang/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Dalam implementasi nyata, query ke database
+    res.json({
+      success: true,
+      data: {
+        id_barang: id,
+        nama_barang: 'Sample Item',
+        jenis_barang: 'Laptop',
+        spesifikasi: 'Sample specification',
+        current_stock: 5
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch item',
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/barang', async (req, res) => {
+  try {
+    // Dalam implementasi nyata, query ke database untuk daftar barang
+    res.json({
+      success: true,
+      data: [
+        {
+          id_barang: 'ITM001',
+          nama_barang: 'Laptop Dell',
+          jenis_barang: 'Laptop',
+          spesifikasi: 'Intel i5, 8GB RAM',
+          current_stock: 10
+        },
+        {
+          id_barang: 'ITM002', 
+          nama_barang: 'Monitor Samsung',
+          jenis_barang: 'Monitor',
+          spesifikasi: '24 inch Full HD',
+          current_stock: 15
+        }
+      ],
+      message: 'Items retrieved successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch items',
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/karyawan', async (req, res) => {
+  try {
+    // Dalam implementasi nyata, query ke database untuk daftar karyawan
+    res.json({
+      success: true,
+      data: [
+        {
+          npk: '12345',
+          nama: 'John Doe',
+          department: 'IT',
+          position: 'Software Engineer'
+        },
+        {
+          npk: '67890',
+          nama: 'Jane Smith', 
+          department: 'HR',
+          position: 'HR Manager'
+        }
+      ],
+      message: 'Employees retrieved successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch employees',
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/gudang', async (req, res) => {
+  try {
+    // Data gudang sesuai dengan requirement
+    res.json({
+      success: true,
+      data: [
+        {
+          id: 1,
+          nama: 'Warehouse IT',
+          kode: 'WH-IT',
+          lokasi: 'Building A Floor 1',
+          kapasitas: 1000
+        },
+        {
+          id: 2,
+          nama: 'Sparepart Room',
+          kode: 'SP-ROOM',
+          lokasi: 'Building A Floor 2', 
+          kapasitas: 500
+        },
+        {
+          id: 3,
+          nama: 'P2B',
+          kode: 'P2B',
+          lokasi: 'Disposal Area',
+          kapasitas: 100
+        }
+      ],
+      message: 'Warehouses retrieved successfully'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch warehouses',
+      error: error.message
+    });
+  }
+});
+
+// Enhanced Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'OK',
+    message: 'WMS Help Desk Operation Server is running',
+    timestamp: new Date().toISOString(),
+    version: process.env.APP_VERSION || '1.0.0',
+    services: {
+      database: 'connected', // Bisa ditambahkan pengecekan database
+      notifications: 'active',
+      transactions: 'active'
+    }
+  });
+});
+
+// API Health check (untuk frontend)
+app.get('/api/health', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'API is running',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Endpoint untuk testing koneksi dari frontend
+app.get('/api/test-connection', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Connection successful',
+    server_time: new Date().toISOString(),
+    endpoints: {
+      transactions: '/api/transaksi',
+      notifications: '/api/notifications',
+      items: '/api/barang',
+      employees: '/api/karyawan',
+      warehouses: '/api/gudang'
+    }
+  });
+});
+
+// 404 handler dengan peningkatan
+app.use((req, res) => {
+  if (req.xhr || (req.headers.accept && req.headers.accept.indexOf('json') > -1)) {
+    res.status(404).json({
+      success: false,
+      message: 'API endpoint not found',
+      path: req.originalUrl,
+      method: req.method,
+      available_endpoints: [
+        'GET /api/transaksi',
+        'POST /api/transaksi', 
+        'GET /api/notifications',
+        'GET /api/barang',
+        'GET /api/karyawan',
+        'GET /api/gudang',
+        'GET /api/health'
+      ]
+    });
+  } else {
+    res.status(404).send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>404 - Page Not Found</title>
+        <style>
+          body { 
+            font-family: Arial, sans-serif; 
+            text-align: center; 
+            padding: 50px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+          }
+          .container {
+            background: rgba(255,255,255,0.1);
+            padding: 40px;
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+            max-width: 500px;
+            margin: 0 auto;
+          }
+          h1 { color: #fff; margin-bottom: 20px; }
+          p { margin: 15px 0; opacity: 0.9; }
+          a { 
+            color: #fff; 
+            text-decoration: none; 
+            background: rgba(255,255,255,0.2);
+            padding: 10px 20px;
+            border-radius: 25px;
+            display: inline-block;
+            margin-top: 20px;
+            transition: all 0.3s ease;
+          }
+          a:hover {
+            background: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
+          }
+          .logo {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            opacity: 0.7;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="logo">📦</div>
+          <h1>404 - Page Not Found</h1>
+          <p>The page you are looking for does not exist.</p>
+          <p><strong>Requested URL:</strong> ${req.originalUrl}</p>
+          <a href="/">🏠 Go back to dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// Error handling middleware
+app.use(errorMiddleware);
+
+// Enhanced error handler
+app.use((err, req, res, next) => {
+  console.error('❌ Unhandled Error:', err.stack);
+  
+  if (req.xhr || (req.headers.accept && req.headers.accept.indexOf('json') > -1)) {
+    res.status(500).json({
+      success: false,
+      message: 'Internal Server Error',
+      error: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    });
+  } else {
+    res.status(500).send(`
+      <h1>500 - Internal Server Error</h1>
+      <p>Something went wrong on our end.</p>
+      <a href="/">Go back to dashboard</a>
+    `);
+  }
+});
+
+// Dashboard Stock Summary
+app.get('/api/dashboard/stock-summary', async (req, res) => {
+  try {
+    const { query } = require('./config/db');
+    
+    const result = await query(`
+      SELECT 
+        COUNT(DISTINCT b.id_barang) as total_items,
+        COUNT(DISTINCT b.id_barang) FILTER (
+          WHERE (
+            COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'), 0) -
+            COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')), 0)
+          ) < 5 AND (
+            COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'), 0) -
+            COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')), 0)
+          ) > 0
+        ) as low_stock_items
+      FROM barang b
+      WHERE EXISTS (SELECT 1 FROM transaksi WHERE id_barang = b.id_barang)
+    `);
+    
+    res.json({
+      success: true,
+      totalItems: parseInt(result.rows[0].total_items) || 0,
+      lowStockItems: parseInt(result.rows[0].low_stock_items) || 0
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch stock summary' });
+  }
+});
+
+// Dashboard Items with Filter
+app.get('/api/dashboard/items', async (req, res) => {
+  try {
+    const { type } = req.query;
+    const { query } = require('./config/db');
+    
+    let sql = `
+      SELECT 
+        b.id_barang,
+        b.nama_barang,
+        b.spesifikasi,
+        COALESCE(
+          (SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'),
+          0
+        ) - COALESCE(
+          (SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')),
+          0
+        ) as qty_stok,
+        (SELECT g.nama_gudang FROM transaksi t 
+         JOIN gudang g ON t.id_gudang = g.id_gudang 
+         WHERE t.id_barang = b.id_barang AND t.status_barang = 'Masuk'
+         ORDER BY t.tanggal DESC LIMIT 1) as location
+      FROM barang b
+      WHERE EXISTS (SELECT 1 FROM transaksi WHERE id_barang = b.id_barang)
+    `;
+    
+    if (type === 'low') {
+      sql += ` AND (
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'), 0) -
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')), 0)
+      ) < 5 AND (
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang = 'Masuk'), 0) -
+        COALESCE((SELECT SUM(qty_stok) FROM transaksi WHERE id_barang = b.id_barang AND status_barang IN ('Assignment', 'Disposal')), 0)
+      ) > 0`;
+    }
+    
+    sql += ` ORDER BY b.nama_barang LIMIT ${type === 'low' ? 5 : 100}`;
+    
+    const result = await query(sql);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json([]);
+  }
+});
+
+// Update transaction stats untuk chart
+app.get('/api/transaction-stats', async (req, res) => {
+  try {
+    const { query } = require('./config/db');
+    
+    const distResult = await query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE kode_transaksi LIKE 'RCV%') as rcv,
+        COUNT(*) FILTER (WHERE kode_transaksi LIKE 'ASG%') as ass,
+        COUNT(*) FILTER (WHERE kode_transaksi LIKE 'DPS%') as disp
+      FROM transaksi
+    `);
+    
+    const monthlyResult = await query(`
+      SELECT 
+        TO_CHAR(tanggal, 'Mon') as month,
+        COUNT(*) as value
+      FROM transaksi 
+      WHERE tanggal >= NOW() - INTERVAL '6 months'
+      GROUP BY TO_CHAR(tanggal, 'Mon'), EXTRACT(MONTH FROM tanggal)
+      ORDER BY EXTRACT(MONTH FROM tanggal)
+    `);
+    
+    res.json({
+      success: true,
+      distribution: distResult.rows[0] || { rcv: 0, ass: 0, disp: 0 },
+      monthly: monthlyResult.rows || []
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({
+      success: false,
+      distribution: { rcv: 0, ass: 0, disp: 0 },
+      monthly: []
+    });
+  }
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log('🚀 WMS Help Desk Operation Server started');
+  console.log(`📍 Server running on: http://localhost:${PORT}`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('📦 Application: Warehouse Management System');
+  console.log('🏢 Division: Help Desk Operation');
+  console.log('📋 Available Endpoints:');
+  console.log('   • GET  /transactions (Web)');
+  console.log('   • GET  /api/transaksi (API)');
+  console.log('   • POST /api/transaksi (API)');
+  console.log('   • GET  /api/notifications (API)');
+  console.log('   • GET  /api/health (API)');
+  console.log('═══════════════════════════════════════════');
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n🛑 Received SIGINT. Shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🛑 Received SIGTERM. Shutting down gracefully...');
+  process.exit(0);
+});
+
+module.exports = app;
